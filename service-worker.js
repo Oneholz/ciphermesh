@@ -1,4 +1,4 @@
-const CACHE_NAME = 'ciphermesh-static-v1';
+const CACHE_NAME = 'ciphermesh-static-v2';
 const STATIC_ASSETS = [
   './',
   './index.html',
@@ -41,19 +41,18 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(request.url);
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
 
-  // Cache-first for same-origin static assets; network-first with cache fallback for CDN ESM modules
+  // Network-first with cache fallback so GitHub Pages updates propagate immediately while staying offline-capable
   if (url.origin === self.location.origin) {
     event.respondWith(
-      caches.match(request).then((cached) => {
-        if (cached) return cached;
-        return fetch(request).then((response) => {
+      fetch(request)
+        .then((response) => {
           if (response && response.status === 200 && response.type === 'basic') {
             const clone = response.clone();
             caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
           }
           return response;
-        });
-      })
+        })
+        .catch(() => caches.match(request))
     );
     return;
   }

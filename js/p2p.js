@@ -1,5 +1,5 @@
 /**
- * CipherMesh Serverless P2P Transport (WebRTC DataChannels via Trystero / Nostr)
+ * CipherMesh Serverless P2P Transport (WebRTC DataChannels via Trystero 0.27+ / Nostr)
  * Includes: Signed peer handshake, Token-Bucket Rate Limiter, Replay Protection, Outbox Auto-Flush
  */
 
@@ -23,6 +23,7 @@ const APP_ID = 'ciphermesh.local.p2p.v1';
 const MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
 const RATE_LIMIT_CAPACITY = 25;
 const RATE_LIMIT_REFILL_PER_SEC = 6;
+const HELLO_RESYNC_MS = 10000;
 
 class PeerRateLimiter {
   constructor(capacity = RATE_LIMIT_CAPACITY, refillPerSec = RATE_LIMIT_REFILL_PER_SEC) {
@@ -54,18 +55,65 @@ class PeerRateLimiter {
   }
 }
 
+function extractPeerId(arg) {
+  if (typeof arg === 'string') return arg;
+  if (arg && typeof arg === 'object') {
+    return arg.peerId || arg.userId || '';
+  }
+  return '';
+}
+
+function wrapAction(actionOrTuple) {
+  if (Array.isArray(actionOrTuple)) {
+    const [sendFn, receiveFn] = actionOrTuple;
+    return {
+      send: (data, targetPeerId) => (targetPeerId ? sendFn(data, targetPeerId) : sendFn(data)),
+      onMessage: (cb) => receiveFn((data, peerId) => cb(data, extractPeerId(peerId)))
+    };
+  }
+  return {
+    send: (data, targetPeerId) =>
+      targetPeerId ? actionOrTuple.send(data, { target: targetPeerId }) : actionOrTuple.send(data),
+    onMessage: (cb) => {
+      if (typeof actionOrTuple.onMessage === 'function') {
+        return actionOrTuple.onMessage((data, ctx) => cb(data, extractPeerId(ctx)));
+      }
+      actionOrTuple.onMessage = (data, ctx) => cb(data, extractPeerId(ctx));
+      return () => {};
+    }
+  };
+}
+
 export class P2PNetwork {
   constructor(callbacks) {
     this.callbacks = callbacks;
     this.room = null;
-    this.sendHello = null;
-    this.sendPacket = null;
+    this.helloAction = null;
+    this.pktAction = null;
     this.identity = null;
     this.peerToUser = new Map();
     this.userToPeers = new Map();
+    this.rawPeers = new Set();
     this.memorySeenIds = new Set();
     this.rateLimiter = new PeerRateLimiter();
     this.connected = false;
+    this.syncTimer = null;
+    this.unsubscribers = [];
+  }
+
+  async sendSignedHelloTo(peerId = null) {
+    if (!this.helloAction || !this.identity) return;
+    try {
+      const hello = await createSignedHello({
+        userId: this.identity.fingerprint,
+        ecdhPubJwk: this.identity.ecdhPubJwk,
+        ecdsaPubJwk: this.identity.ecdsaPubJwk,
+        myEcdsaPrivateKey: this.identity.ecdsaPrivateKey
+      });
+      await this.helloAction.send(hello, peerId || undefined);
+    } catch {
+      // ignore transient peer disconnect during handshake
+    }
   }
 
   async connect({ roomId, signalingPassword, identity }) {
@@ -77,81 +125,128 @@ export class P2PNetwork {
       trystero = await import(TRYSTERO_ESM_URL);
     } catch {
       this.connected = false;
-      this.callbacks.onStatusChange(false, 'Офлайн (нет доступа к релеям)');
+      this.callbacks.onStatusChange(false, 'Офлайн (нет доступа к Trystero CDN)');
       return false;
     }
 
-    const { joinRoom } = trystero;
-    this.room = joinRoom(
-      {
-        appId: APP_ID,
-        password: signalingPassword,
-        trickleIce: true
-      },
-      roomId
-    );
+    try {
+      const { joinRoom } = trystero;
+      this.room = joinRoom(
+        {
+          appId: APP_ID,
+          password: signalingPassword,
+          trickleIce: true
+        },
+        roomId
+      );
 
-    const [sendHello, getHello] = this.room.makeAction('cm_hello');
-    const [sendPacket, getPacket] = this.room.makeAction('cm_pkt');
-    this.sendHello = sendHello;
-    this.sendPacket = sendPacket;
+      this.helloAction = wrapAction(this.room.makeAction('cm_hello'));
+      this.pktAction = wrapAction(this.room.makeAction('cm_pkt'));
 
-    this.room.onPeerJoin(async (peerId) => {
-      try {
-        const hello = await createSignedHello({
-          userId: this.identity.fingerprint,
-          ecdhPubJwk: this.identity.ecdhPubJwk,
-          ecdsaPubJwk: this.identity.ecdsaPubJwk,
-          myEcdsaPrivateKey: this.identity.ecdsaPrivateKey
-        });
-        this.sendHello(hello, peerId);
-      } catch {
-        // ignore transient peer disconnect during handshake
-      }
-    });
+      const unsubHello = this.helloAction.onMessage(async (hello, peerId) => {
+        if (!peerId || !this.rateLimiter.allow(peerId)) return;
+        const valid = await verifySignedHello(hello);
+        if (!valid) return;
+        if (hello.userId === this.identity.fingerprint) return;
 
-    this.room.onPeerLeave((peerId) => {
-      this.rateLimiter.remove(peerId);
-      const userId = this.peerToUser.get(peerId);
-      this.peerToUser.delete(peerId);
-      if (userId) {
-        const set = this.userToPeers.get(userId);
-        if (set) {
-          set.delete(peerId);
-          if (set.size === 0) {
-            this.userToPeers.delete(userId);
-            this.callbacks.onPeerPresence(userId, false);
+        const isNewBinding = this.peerToUser.get(peerId) !== hello.userId;
+        this.peerToUser.set(peerId, hello.userId);
+        if (!this.userToPeers.has(hello.userId)) {
+          this.userToPeers.set(hello.userId, new Set());
+        }
+        this.userToPeers.get(hello.userId).add(peerId);
+
+        if (isNewBinding) {
+          this.callbacks.onPeerPresence(hello.userId, true);
+          this.emitNetworkCount();
+          await this.sendSignedHelloTo(peerId);
+        }
+        await this.flushOutboxForUser(hello.userId);
+      });
+      if (typeof unsubHello === 'function') this.unsubscribers.push(unsubHello);
+
+      const unsubPkt = this.pktAction.onMessage(async (packet, peerId) => {
+        if (!peerId || !this.rateLimiter.allow(peerId)) return;
+        await this.handleIncomingPacket(packet, peerId);
+      });
+      if (typeof unsubPkt === 'function') this.unsubscribers.push(unsubPkt);
+
+      const handlePeerJoin = async (info) => {
+        const peerId = extractPeerId(info);
+        if (!peerId) return;
+        this.rawPeers.add(peerId);
+        this.emitNetworkCount();
+        await this.sendSignedHelloTo(peerId);
+      };
+
+      const handlePeerLeave = (info) => {
+        const peerId = extractPeerId(info);
+        if (!peerId) return;
+        this.rawPeers.delete(peerId);
+        this.rateLimiter.remove(peerId);
+        const userId = this.peerToUser.get(peerId);
+        this.peerToUser.delete(peerId);
+        if (userId) {
+          const set = this.userToPeers.get(userId);
+          if (set) {
+            set.delete(peerId);
+            if (set.size === 0) {
+              this.userToPeers.delete(userId);
+              this.callbacks.onPeerPresence(userId, false);
+            }
           }
         }
+        this.emitNetworkCount();
+      };
+
+      if (typeof this.room.onPeerJoin === 'function') {
+        const u1 = this.room.onPeerJoin(handlePeerJoin);
+        if (typeof u1 === 'function') this.unsubscribers.push(u1);
+      } else {
+        this.room.onPeerJoin = handlePeerJoin;
       }
-      this.emitNetworkCount();
-    });
 
-    getHello(async (hello, peerId) => {
-      if (!this.rateLimiter.allow(peerId)) return;
-      const valid = await verifySignedHello(hello);
-      if (!valid) return;
-      if (hello.userId === this.identity.fingerprint) return;
-
-      this.peerToUser.set(peerId, hello.userId);
-      if (!this.userToPeers.has(hello.userId)) {
-        this.userToPeers.set(hello.userId, new Set());
+      if (typeof this.room.onPeerLeave === 'function') {
+        const u2 = this.room.onPeerLeave(handlePeerLeave);
+        if (typeof u2 === 'function') this.unsubscribers.push(u2);
+      } else {
+        this.room.onPeerLeave = handlePeerLeave;
       }
-      this.userToPeers.get(hello.userId).add(peerId);
 
-      this.callbacks.onPeerPresence(hello.userId, true);
+      if (typeof this.room.onError === 'function') {
+        const u3 = this.room.onError(() => {
+          this.emitNetworkCount();
+        });
+        if (typeof u3 === 'function') this.unsubscribers.push(u3);
+      }
+
+      // Replay already connected peers if any
+      if (typeof this.room.getPeers === 'function') {
+        const existing = Object.keys(this.room.getPeers() || {});
+        for (const peerId of existing) {
+          handlePeerJoin(peerId);
+        }
+      }
+
+      // Periodic handshake & outbox resync for reliability across NAT/mobile reconnects
+      this.syncTimer = setInterval(async () => {
+        if (!this.connected) return;
+        if (this.rawPeers.size > 0) {
+          await this.sendSignedHelloTo(null);
+        }
+        for (const userId of this.userToPeers.keys()) {
+          await this.flushOutboxForUser(userId);
+        }
+      }, HELLO_RESYNC_MS);
+
+      this.connected = true;
       this.emitNetworkCount();
-      await this.flushOutboxForUser(hello.userId);
-    });
-
-    getPacket(async (packet, peerId) => {
-      if (!this.rateLimiter.allow(peerId)) return;
-      await this.handleIncomingPacket(packet, peerId);
-    });
-
-    this.connected = true;
-    this.emitNetworkCount();
-    return true;
+      return true;
+    } catch {
+      this.connected = false;
+      this.callbacks.onStatusChange(false, 'Ошибка P2P-инициализации');
+      return false;
+    }
   }
 
   emitNetworkCount() {
@@ -159,9 +254,15 @@ export class P2PNetwork {
       this.callbacks.onStatusChange(false, 'Офлайн');
       return;
     }
-    const onlineCount = this.userToPeers.size;
-    const label = onlineCount > 0 ? `P2P активен · пиров: ${onlineCount}` : 'P2P готов · поиск пиров';
-    this.callbacks.onStatusChange(true, label);
+    const verifiedCount = this.userToPeers.size;
+    const rawCount = this.rawPeers.size;
+    if (verifiedCount > 0) {
+      this.callbacks.onStatusChange(true, `P2P активен · контактов: ${verifiedCount}`);
+    } else if (rawCount > 0) {
+      this.callbacks.onStatusChange(true, `P2P рукопожатие · пиров: ${rawCount}`);
+    } else {
+      this.callbacks.onStatusChange(true, 'P2P готов · поиск пиров');
+    }
   }
 
   isUserOnline(userId) {
@@ -170,14 +271,14 @@ export class P2PNetwork {
   }
 
   async sendToUser(userId, packet) {
-    if (!this.sendPacket) return false;
+    if (!this.pktAction) return false;
     const peers = this.userToPeers.get(userId);
     if (!peers || peers.size === 0) return false;
 
     let sentAny = false;
     for (const peerId of peers) {
       try {
-        await this.sendPacket(packet, peerId);
+        await this.pktAction.send(packet, peerId);
         sentAny = true;
       } catch {
         // peer channel may have closed; keep queued in outbox until ACK arrives
@@ -274,6 +375,18 @@ export class P2PNetwork {
   }
 
   async disconnect() {
+    if (this.syncTimer) {
+      clearInterval(this.syncTimer);
+      this.syncTimer = null;
+    }
+    for (const unsub of this.unsubscribers) {
+      try {
+        unsub();
+      } catch {
+        // ignore unsubscribe error
+      }
+    }
+    this.unsubscribers = [];
     if (this.room) {
       try {
         await this.room.leave();
@@ -282,10 +395,11 @@ export class P2PNetwork {
       }
     }
     this.room = null;
-    this.sendHello = null;
-    this.sendPacket = null;
+    this.helloAction = null;
+    this.pktAction = null;
     this.peerToUser.clear();
     this.userToPeers.clear();
+    this.rawPeers.clear();
     this.memorySeenIds.clear();
     this.connected = false;
   }
